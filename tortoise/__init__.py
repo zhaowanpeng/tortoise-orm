@@ -31,6 +31,8 @@ from tortoise.utils import generate_schema_for_client
 class Tortoise:
     apps: Dict[str, Dict[str, Type["Model"]]] = {}
     _inited: bool = False
+    dburl_name: Dict = {}
+    apps_modules: Dict = {}
 
     @classmethod
     def get_connection(cls, connection_name: str) -> BaseDBAsyncClient:
