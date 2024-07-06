@@ -8,11 +8,11 @@ from copy import deepcopy
 from inspect import isclass
 from types import ModuleType
 from typing import Coroutine, Dict, Iterable, List, Optional, Tuple, Type, Union, cast
-
+from collections import OrderedDict
 from pypika import Table
 
 from tortoise.backends.base.client import BaseDBAsyncClient
-from tortoise.backends.base.config_generator import expand_db_url, generate_config
+from tortoise.backends.base.config_generator import expand_db_url, generate_config, generate_app_config
 from tortoise.connection import connections
 from tortoise.exceptions import ConfigurationError
 from tortoise.fields.relational import (
@@ -29,10 +29,20 @@ from tortoise.utils import generate_schema_for_client
 
 
 class Tortoise:
-    apps: Dict[str, Dict[str, Type["Model"]]] = {}
     _inited: bool = False
-    dburl_name: Dict = {}
-    apps_modules: Dict = {}
+    apps: Dict[str, Dict[str, Type["Model"]]] = {}
+    _apps_inited: OrderedDict = OrderedDict()  # Dict[str, Iterable[Union[str, ModuleType]]] = {}
+    apps_modules: OrderedDict = OrderedDict()
+    apps_dburl: OrderedDict = OrderedDict()
+
+    # dburl_name: OrderedDict = OrderedDict()
+
+    #     ...
+    # class Tortoise:
+    #     apps: Dict[str, Dict[str, Type["Model"]]] = {}
+    #     _inited: bool = False
+    #     dburl_name: Dict = {}
+    #     apps_modules: Dict = {}
 
     @classmethod
     def get_connection(cls, connection_name: str) -> BaseDBAsyncClient:
@@ -49,7 +59,7 @@ class Tortoise:
 
     @classmethod
     def describe_model(
-        cls, model: Type["Model"], serializable: bool = True
+            cls, model: Type["Model"], serializable: bool = True
     ) -> dict:  # pragma: nocoverage
         """
         Describes the given list of models or ALL registered models.
@@ -75,7 +85,7 @@ class Tortoise:
 
     @classmethod
     def describe_models(
-        cls, models: Optional[List[Type["Model"]]] = None, serializable: bool = True
+            cls, models: Optional[List[Type["Model"]]] = None, serializable: bool = True
     ) -> Dict[str, dict]:
         """
         Describes the given list of models or ALL registered models.
@@ -347,7 +357,7 @@ class Tortoise:
 
     @classmethod
     def _discover_models(
-        cls, models_path: Union[ModuleType, str], app_label: str
+            cls, models_path: Union[ModuleType, str], app_label: str
     ) -> List[Type["Model"]]:
         if isinstance(models_path, ModuleType):
             module = models_path
@@ -376,10 +386,10 @@ class Tortoise:
 
     @classmethod
     def init_models(
-        cls,
-        models_paths: Iterable[Union[ModuleType, str]],
-        app_label: str,
-        _init_relations: bool = True,
+            cls,
+            models_paths: Iterable[Union[ModuleType, str]],
+            app_label: str,
+            _init_relations: bool = True,
     ) -> None:
         """
         Early initialisation of Tortoise ORM Models.
@@ -453,15 +463,15 @@ class Tortoise:
 
     @classmethod
     async def init(
-        cls,
-        config: Optional[dict] = None,
-        config_file: Optional[str] = None,
-        _create_db: bool = False,
-        db_url: Optional[str] = None,
-        modules: Optional[Dict[str, Iterable[Union[str, ModuleType]]]] = None,
-        use_tz: bool = False,
-        timezone: str = "UTC",
-        routers: Optional[List[Union[str, Type]]] = None,
+            cls,
+            config: Optional[dict] = None,
+            config_file: Optional[str] = None,
+            _create_db: bool = False,
+            db_url: Optional[str] = None,
+            modules: Optional[Dict[str, Iterable[Union[str, ModuleType]]]] = None,
+            use_tz: bool = False,
+            timezone: str = "UTC",
+            routers: Optional[List[Union[str, Type]]] = None,
     ) -> None:
         """
         Sets up Tortoise-ORM.
@@ -643,6 +653,15 @@ class Tortoise:
             await generate_schema_for_client(connection, safe)
 
     @classmethod
+    async def generate_app_schema(cls, app_name: str, safe: bool = True):
+        if app_name not in cls._apps_inited or not cls._apps_inited[app_name]:
+            raise ConfigurationError(f"App '{app_name}' not initialized.")
+
+        connection = connections.get_app_connection(app_name)
+        await generate_schema_for_client(connection, safe)
+
+
+    @classmethod
     async def _drop_databases(cls) -> None:
         """
         Tries to drop all databases provided in config passed to ``.init()`` method.
@@ -665,6 +684,216 @@ class Tortoise:
     def _init_timezone(cls, use_tz: bool, timezone: str) -> None:
         os.environ["USE_TZ"] = str(use_tz)
         os.environ["TIMEZONE"] = timezone
+
+    @classmethod
+    def _init_relations_for_app(cls, app_name: str) -> None:
+        def get_related_model(reference: str) -> Type["Model"]:
+            related_app_name, related_model_name = split_reference(reference)
+            try:
+                return cls.apps[related_app_name][related_model_name]
+            except KeyError:
+                if related_app_name not in cls.apps:
+                    raise ConfigurationError(f"No app with name '{related_app_name}' registered.")
+                raise ConfigurationError(f"No model '{related_model_name}' in app '{related_app_name}'.")
+
+        def split_reference(reference: str) -> Tuple[str, str]:
+            items = reference.split(".")
+            if len(items) != 2:
+                raise ConfigurationError(f"'{reference}' is not a valid model reference.")
+            return items[0], items[1]
+
+        def setup_field(field_object, related_model, field_name):
+            if field_object.to_field:
+                related_field = related_model._meta.fields_map.get(field_object.to_field)
+                if not related_field or not related_field.unique:
+                    raise ConfigurationError(f"Invalid 'to_field' for {field_name}")
+                key_object = deepcopy(related_field)
+                field_object.to_field_instance = related_field
+            else:
+                key_object = deepcopy(related_model._meta.pk)
+                field_object.to_field_instance = related_model._meta.pk
+                field_object.to_field = related_model._meta.pk_attr
+
+            field_object.field_type = field_object.to_field_instance.field_type
+            return key_object
+
+        def setup_backward_relation(model, related_model, field, relation_class, **kwargs):
+            backward_relation_name = field.related_name or f"{model._meta.db_table}s"
+            if backward_relation_name in related_model._meta.fields:
+                raise ConfigurationError(f"Duplicate backward relation '{backward_relation_name}' in {related_model}")
+            relation = relation_class(model, **kwargs)
+            relation.to_field_instance = field.to_field_instance
+            related_model._meta.add_field(backward_relation_name, relation)
+
+        for model in cls.apps_modules[app_name].values():
+            if model._meta._inited:
+                continue
+            model._meta._inited = True
+            model._meta.db_table = model._meta.db_table or model.__name__.lower()
+
+            for field_name in sorted(model._meta.fk_fields):
+                cls._setup_fk_field(model, field_name, get_related_model, setup_field, setup_backward_relation)
+
+            for field_name in model._meta.o2o_fields:
+                cls._setup_o2o_field(model, field_name, get_related_model, setup_field, setup_backward_relation)
+
+            for field_name in list(model._meta.m2m_fields):
+                cls._setup_m2m_field(model, field_name, get_related_model, setup_backward_relation)
+
+    @classmethod
+    def _setup_fk_field(cls, model, field_name, get_related_model, setup_field, setup_backward_relation):
+        fk_object = model._meta.fields_map[field_name]
+        related_model = get_related_model(fk_object.model_name)
+        key_fk_object = setup_field(fk_object, related_model, field_name)
+
+        key_field = f"{field_name}_id"
+        key_fk_object.pk = False
+        key_fk_object.unique = False
+        key_fk_object.index = fk_object.index
+        key_fk_object.default = fk_object.default
+        key_fk_object.null = fk_object.null
+        key_fk_object.generated = fk_object.generated
+        key_fk_object.reference = fk_object
+        key_fk_object.description = fk_object.description
+        key_fk_object.source_field = fk_object.source_field or key_field
+        model._meta.add_field(key_field, key_fk_object)
+
+        fk_object.related_model = related_model
+        fk_object.source_field = key_field
+
+        if fk_object.related_name is not False:
+            setup_backward_relation(
+                model, related_model, fk_object, BackwardFKRelation,
+                field=f"{field_name}_id",
+                to_field=key_fk_object.source_field,
+                null=fk_object.null,
+                description=fk_object.description
+            )
+
+    @classmethod
+    def _setup_o2o_field(cls, model, field_name, get_related_model, setup_field, setup_backward_relation):
+        o2o_object = model._meta.fields_map[field_name]
+        related_model = get_related_model(o2o_object.model_name)
+        key_o2o_object = setup_field(o2o_object, related_model, field_name)
+
+        key_field = f"{field_name}_id"
+        key_o2o_object.pk = o2o_object.pk
+        key_o2o_object.index = o2o_object.index
+        key_o2o_object.default = o2o_object.default
+        key_o2o_object.null = o2o_object.null
+        key_o2o_object.unique = o2o_object.unique
+        key_o2o_object.generated = o2o_object.generated
+        key_o2o_object.reference = o2o_object
+        key_o2o_object.description = o2o_object.description
+        key_o2o_object.source_field = o2o_object.source_field or key_field
+        model._meta.add_field(key_field, key_o2o_object)
+
+        o2o_object.related_model = related_model
+        o2o_object.source_field = key_field
+
+        if o2o_object.related_name is not False:
+            setup_backward_relation(
+                model, related_model, o2o_object, BackwardOneToOneRelation,
+                field=f"{field_name}_id",
+                to_field=key_o2o_object.source_field,
+                null=True,
+                description=o2o_object.description
+            )
+
+        if o2o_object.pk:
+            model._meta.pk_attr = key_field
+
+    @classmethod
+    def _setup_m2m_field(cls, model, field_name, get_related_model, setup_backward_relation):
+        m2m_object = model._meta.fields_map[field_name]
+        if m2m_object._generated:
+            return
+
+        related_model = get_related_model(m2m_object.model_name)
+        m2m_object.related_model = related_model
+
+        m2m_object.backward_key = m2m_object.backward_key or f"{model._meta.db_table}_id"
+        if m2m_object.backward_key == m2m_object.forward_key:
+            m2m_object.backward_key = f"{model._meta.db_table}_rel_id"
+
+        m2m_object.through = m2m_object.through or f"{model._meta.db_table}_{related_model._meta.db_table}"
+
+        setup_backward_relation(
+            model, related_model, m2m_object, ManyToManyFieldInstance,
+            model_name=f"{model._meta.app}.{model.__name__}",
+            through=m2m_object.through,
+            forward_key=m2m_object.backward_key,
+            backward_key=m2m_object.forward_key,
+            field_name=field_name,
+            field_type=model,
+            description=m2m_object.description
+        )
+
+        model._meta.filters.update(get_m2m_filters(field_name, m2m_object))
+
+    @classmethod
+    def _build_initial_querysets_for_app(cls, app_name: str) -> None:
+
+        for model in cls.apps_modules[app_name].values():
+            model._meta.finalise_model()
+            model._meta.basetable = Table(name=model._meta.db_table, schema=model._meta.schema)
+            model._meta.basequery = model._meta.db.query_class.from_(model._meta.basetable)
+            model._meta.basequery_all_fields = model._meta.basequery.select(
+                *model._meta.db_fields
+            )
+
+    @classmethod
+    def _init_app(cls, apps_config: dict, app_name: str) -> None:
+        info = apps_config[app_name]
+
+        try:
+            connections.get(info.get("default_connection", "default"))
+        except KeyError:
+            raise ConfigurationError(
+                'Unknown connection "{}" for app "{}"'.format(
+                    info.get("default_connection", "default"), app_name
+                )
+            )
+
+        cls.init_models(info["models"], app_name, _init_relations=False)
+
+        for model in cls.apps[app_name].values():
+            model._meta.default_connection = info.get("default_connection", "default")
+
+        cls._init_relations_for_app(app_name)
+
+        cls._build_initial_querysets_for_app(app_name)
+
+    @classmethod
+    async def load_app(cls,
+                       app_name: str,
+                       models_paths: Iterable[Union[ModuleType, str]],
+                       db_url: str,
+                       use_tz: bool = False,
+                       timezone: str = "UTC",
+                       generate_schemas: bool = False,
+                       _create_db: bool = False,
+                       ) -> None:
+
+        if app_name in cls.apps_modules:
+            raise ValueError(f"App '{app_name}' has already been initialized.")
+
+        models_paths = [models_paths] if isinstance(models_paths, str) else list(models_paths)
+
+        cls.apps_modules[app_name] = models_paths
+        cls.apps_dburl[app_name] = db_url
+
+        config = generate_app_config(app_name, models_paths, db_url)
+
+        cls._init_timezone(use_tz, timezone)
+
+        await connections._init(config["connections"], _create_db)
+
+        cls._init_app(config["apps"], app_name)
+
+        cls._apps_inited[app_name] = True
+
+        # cls._init_routers() 暂时没有用到
 
 
 def run_async(coro: Coroutine) -> None:

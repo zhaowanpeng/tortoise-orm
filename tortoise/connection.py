@@ -191,5 +191,13 @@ class ConnectionHandler:
             for alias in self.db_config:
                 self.discard(alias)
 
+    def get_app_connection(self, app_name: str) -> "BaseDBAsyncClient":
+        try:
+            db_alias = self.db_config[app_name]["default_connection"]
+        except KeyError:
+            raise ConfigurationError(f"No configuration for app '{app_name}' found.")
+
+        return self.get(db_alias)
+
 
 connections = ConnectionHandler()

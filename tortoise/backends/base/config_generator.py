@@ -179,10 +179,10 @@ def expand_db_url(db_url: str, testing: bool = False) -> dict:
 
 
 def generate_config(
-    db_url: str,
-    app_modules: Dict[str, Iterable[Union[str, ModuleType]]],
-    connection_label: Optional[str] = None,
-    testing: bool = False,
+        db_url: str,
+        app_modules: Dict[str, Iterable[Union[str, ModuleType]]],
+        connection_label: Optional[str] = None,
+        testing: bool = False,
 ) -> dict:
     _connection_label = connection_label or "default"
     return {
@@ -190,5 +190,21 @@ def generate_config(
         "apps": {
             app_label: {"models": modules, "default_connection": _connection_label}
             for app_label, modules in app_modules.items()
+        },
+    }
+
+
+def generate_app_config(
+        app_name: str,
+        models_paths: Iterable[Union[ModuleType, str]],
+        db_url: str,
+        # connection_label: Optional[str] = None,
+        testing: bool = False,
+) -> dict:
+    # _connection_label = connection_label or "default"
+    return {
+        "connections": {app_name: expand_db_url(db_url, testing)},
+        "apps": {
+            app_name: {"models": models_paths, "default_connection": app_name}
         },
     }
